@@ -213,6 +213,12 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl = 0
+        mean_actor_grad_norm = 0
+        mean_critic_grad_norm = 0
+        all_returns = []
+        all_values = []
+
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -275,6 +281,7 @@ class PPO:
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+                    mean_kl += kl_mean.item()
 
                     # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
@@ -371,6 +378,8 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
+            mean_actor_grad_norm += nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=float('inf'))
+            mean_critic_grad_norm += nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=float('inf'))
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
@@ -382,6 +391,8 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            all_returns.append(batch.returns.detach())
+            all_values.append(batch.values.detach())
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -394,10 +405,17 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl /= num_updates
+        mean_actor_grad_norm /= num_updates
+        mean_critic_grad_norm /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        all_returns_cat = torch.cat(all_returns)
+        all_values_cat = torch.cat(all_values)
+        returns_var = torch.var(all_returns_cat)
+        explained_variance = (1.0 - torch.var(all_returns_cat - all_values_cat) / (returns_var + 1e-8)).item()
 
         # Clear the storage
         self.storage.clear()
@@ -407,6 +425,10 @@ class PPO:
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "mean_kl": mean_kl,
+            "mean_actor_grad_norm": mean_actor_grad_norm,
+            "mean_critic_grad_norm": mean_critic_grad_norm,
+            "explained_variance": explained_variance,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
